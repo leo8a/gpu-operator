@@ -1,0 +1,95 @@
+name: Nightly Build and Push Images
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # 00:00 CET+2 (midnight Spain)
+  workflow_dispatch:
+
+jobs:
+  discover-branches:
+    name: Discover branches to build
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.list.outputs.branches }}
+    steps:
+      - name: List main and release branches
+        id: list
+        run: |
+          branches=$(gh api repos/${{ github.repository }}/branches --paginate \
+            --jq '[.[] | select(.name == "main" or (.name | startswith("release-v"))) | .name] | @json')
+          echo "branches=${branches}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  build-push-images:
+    name: Build and push images (${{ matrix.branch }})
+    needs: discover-branches
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.discover-branches.outputs.branches) }}
+    permissions:
+      contents: read
+    env:
+      DOCKER_REGISTRY: quay.io/${{ vars.QUAY_NAMESPACE }}
+      IMAGE_NAME: amd-gpu-operator
+      IMAGE_TAG: ${{ matrix.branch }}
+      UTILS_IMAGE_TAG: ${{ matrix.branch }}
+      BUNDLE_IMG: quay.io/${{ vars.QUAY_NAMESPACE }}/amd-gpu-operator-bundle:${{ matrix.branch }}
+      INDEX_IMG: quay.io/${{ vars.QUAY_NAMESPACE }}/amd-gpu-operator-index:${{ matrix.branch }}
+
+    steps:
+      - name: Checkout ${{ matrix.branch }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Resolve PROJECT_VERSION
+        if: matrix.branch == 'main'
+        run: |
+          PROJECT_VERSION=$(git ls-remote --heads origin 'release-v*' \
+            | awk '{print $2}' | sed 's|refs/heads/release-||' | sort -V | tail -n1)
+          echo "PROJECT_VERSION=${PROJECT_VERSION}" >> $GITHUB_ENV
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Log in to quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Download Helm chart dependencies
+        run: cd helm-charts-k8s && helm dependency update
+
+      - name: Update version in source files
+        run: make update-version
+
+      - name: Build and push operator image
+        run: make docker-build docker-push
+
+      - name: Build and push utils image
+        run: |
+          if make -n docker-build-utils &>/dev/null; then
+            make docker-build-utils docker-push-utils
+          else
+            echo "docker-build-utils target not available in ${{ matrix.branch }}, skipping."
+          fi
+
+      - name: Build and push bundle image
+        run: make bundle-build bundle-push
+
+      - name: Build and push catalog image
+        run: |
+          make opm
+          ./bin/opm index add \
+            --bundles  "${BUNDLE_IMG}" \
+            --tag      "${INDEX_IMG}" \
+            --container-tool docker
+          docker push "${INDEX_IMG}"
